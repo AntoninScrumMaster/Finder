@@ -9,6 +9,7 @@
   },
   "dependencies": {
     "@anthropic-ai/sdk": "^0.68.0",
+    "@supabase/supabase-js": "^2.58.0",
     "dotenv": "^17.2.3",
     "imapflow": "^1.0.191",
     "mailparser": "^3.7.4"
