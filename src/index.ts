@@ -2,6 +2,7 @@ import "dotenv/config";
 import { fetchRecentEmails } from "./imap.js";
 import { extractListings, type Listing } from "./extract.js";
 import { getProfile, processListing, type ResultatTraitement } from "./store.js";
+import { associerUrlsAnnonces } from "./urls.js";
 
 /**
  * En dessous de ce seuil (€/m²), le prix/m² est presque toujours le signe
@@ -68,6 +69,8 @@ async function main() {
     );
     const listings = await extractListings(email);
     console.log(`  → ${listings.length} annonce(s) extraite(s).`);
+
+    associerUrlsAnnonces(listings, email.html, email.subject);
 
     for (const listing of listings) {
       total += 1;
