@@ -113,6 +113,113 @@ export interface ResultatTraitement {
   fiabiliteLoyer: string | null;
 }
 
+export interface ListingConnu {
+  listingId: string;
+  ville: string | null;
+  prix: number | null;
+  resultat: ResultatTraitement;
+}
+
+interface ListingParUrlRow {
+  id: string;
+  url: string;
+  ville: string | null;
+  prix: number | null;
+}
+
+interface AnalyseRow {
+  listing_id: string;
+  prix_m2: number | null;
+  rendement_brut: number | null;
+  rendement_net: number | null;
+  cashflow_mensuel: number | null;
+  niveau_loyer: string | null;
+  fiabilite_loyer: string | null;
+  eligible: boolean;
+  exclusion_raison: string | null;
+}
+
+/**
+ * Pré-filtrage sans LLM : pour une liste d'URLs déjà extraites
+ * déterministiquement (urls.ts), renvoie celles déjà connues en base avec
+ * leur dernière analyse pour le profil donné. Permet de sauter l'appel LLM
+ * pour un mail entier si toutes ses annonces sont déjà connues.
+ */
+export async function trouverConnusParUrl(
+  urls: string[],
+  profileId: string,
+): Promise<Map<string, ListingConnu>> {
+  const resultat = new Map<string, ListingConnu>();
+  if (urls.length === 0) return resultat;
+
+  const { data: listingsData, error: erreurListings } = await supabase
+    .from("listings")
+    .select("id, url, ville, prix")
+    .in("url", urls);
+
+  if (erreurListings) {
+    throw new Error(`Recherche de listings par url échouée : ${erreurListings.message}`);
+  }
+
+  const listings = (listingsData ?? []) as ListingParUrlRow[];
+  if (listings.length === 0) return resultat;
+
+  const ids = listings.map((l) => l.id);
+
+  const { data: analysesData, error: erreurAnalyses } = await supabase
+    .from("analyses")
+    .select(
+      "listing_id, prix_m2, rendement_brut, rendement_net, cashflow_mensuel, niveau_loyer, fiabilite_loyer, eligible, exclusion_raison",
+    )
+    .eq("profile_id", profileId)
+    .in("listing_id", ids);
+
+  if (erreurAnalyses) {
+    throw new Error(`Recherche des analyses échouée : ${erreurAnalyses.message}`);
+  }
+
+  const analysesParListing = new Map<string, AnalyseRow>();
+  for (const a of (analysesData ?? []) as AnalyseRow[]) {
+    analysesParListing.set(a.listing_id, a);
+  }
+
+  for (const l of listings) {
+    const analyse = analysesParListing.get(l.id);
+    resultat.set(l.url, {
+      listingId: l.id,
+      ville: l.ville,
+      prix: l.prix,
+      resultat: {
+        nouveau: false,
+        eligible: analyse?.eligible ?? false,
+        raison: analyse?.exclusion_raison ?? null,
+        prixM2: analyse?.prix_m2 ?? null,
+        rendementBrut: analyse?.rendement_brut ?? null,
+        rendementNet: analyse?.rendement_net ?? null,
+        cashflow: analyse?.cashflow_mensuel ?? null,
+        niveauLoyer: analyse?.niveau_loyer ?? null,
+        fiabiliteLoyer: analyse?.fiabilite_loyer ?? null,
+      },
+    });
+  }
+
+  return resultat;
+}
+
+/** Touche last_seen_at pour des listings déjà connus, sans appel LLM. */
+export async function marquerVus(listingIds: string[]): Promise<void> {
+  if (listingIds.length === 0) return;
+
+  const { error } = await supabase
+    .from("listings")
+    .update({ last_seen_at: new Date().toISOString() })
+    .in("id", listingIds);
+
+  if (error) {
+    throw new Error(`Mise à jour last_seen_at échouée : ${error.message}`);
+  }
+}
+
 /**
  * Enregistre (ou met à jour) une annonce dans Supabase, résout sa commune,
  * calcule sa rentabilité et met à jour son analyse pour le profil donné.

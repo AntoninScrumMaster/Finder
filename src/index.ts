@@ -1,8 +1,14 @@
 import "dotenv/config";
 import { fetchRecentEmails } from "./imap.js";
-import { extractListings, type Listing } from "./extract.js";
-import { getProfile, processListing, type ResultatTraitement } from "./store.js";
-import { associerUrlsAnnonces } from "./urls.js";
+import { extractListings } from "./extract.js";
+import {
+  getProfile,
+  processListing,
+  trouverConnusParUrl,
+  marquerVus,
+  type ResultatTraitement,
+} from "./store.js";
+import { associerUrlsAnnonces, associerImagesAnnonces, extraireUrlsAnnonces } from "./urls.js";
 
 /**
  * En dessous de ce seuil (€/m²), le prix/m² est presque toujours le signe
@@ -12,17 +18,25 @@ import { associerUrlsAnnonces } from "./urls.js";
  */
 const SEUIL_PRIX_M2_PLAUSIBLE = 500;
 
-function formatLigne(listing: Listing, resultat: ResultatTraitement): string {
+/** Tarif intro Sonnet 5, en $ par million de tokens (jusqu'au 2026-08-31). */
+const PRIX_INPUT_PAR_MTOK = 2;
+const PRIX_OUTPUT_PAR_MTOK = 10;
+
+function formatLigne(
+  bien: { ville: string | null; prix: number | null },
+  resultat: ResultatTraitement,
+  viaLLM: boolean,
+): string {
   const surfaceSuspecte =
     resultat.prixM2 !== null && resultat.prixM2 < SEUIL_PRIX_M2_PLAUSIBLE;
 
   const alerte = surfaceSuspecte ? "⚠️ " : "   ";
   const statutNouveau = resultat.nouveau ? "🆕" : "↻ ";
 
-  const ville = (listing.ville ?? "ville inconnue").padEnd(24);
+  const ville = (bien.ville ?? "ville inconnue").padEnd(24);
   const prix =
-    listing.prix !== null
-      ? `${listing.prix.toLocaleString("fr-FR")} €`.padStart(10)
+    bien.prix !== null
+      ? `${bien.prix.toLocaleString("fr-FR")} €`.padStart(10)
       : "prix inconnu".padStart(10);
   const prixM2 =
     resultat.prixM2 !== null
@@ -45,8 +59,9 @@ function formatLigne(listing: Listing, resultat: ResultatTraitement): string {
 
   const verdict = resultat.eligible ? "✅" : `⛔ ${resultat.raison ?? "hors critères"}`;
   const mentionSurface = surfaceSuspecte ? " (surface à vérifier)" : "";
+  const mentionLLM = viaLLM ? "" : " [LLM ignoré]";
 
-  return `    ${alerte}${statutNouveau} ${ville} — ${prix} — ${prixM2} — ${rendements} — ${cashflow} — ${zone} — ${verdict}${mentionSurface}`;
+  return `    ${alerte}${statutNouveau} ${ville} — ${prix} — ${prixM2} — ${rendements} — ${cashflow} — ${zone} — ${verdict}${mentionSurface}${mentionLLM}`;
 }
 
 async function main() {
@@ -62,15 +77,47 @@ async function main() {
   let nouvelles = 0;
   let eligibles = 0;
   let surfacesAVerifier = 0;
+  let appelsLLM = 0;
+  let mailsIgnores = 0;
+  let totalInputTokens = 0;
+  let totalOutputTokens = 0;
 
   for (const [index, email] of emails.entries()) {
     console.log(
-      `\n[${index + 1}/${emails.length}] Extraction depuis "${email.subject}" (de ${email.from})...`,
+      `\n[${index + 1}/${emails.length}] "${email.subject}" (de ${email.from})...`,
     );
-    const listings = await extractListings(email);
+
+    // Pré-filtrage sans LLM : si toutes les URLs de ce mail sont déjà
+    // connues en base, pas besoin de renvoyer le mail au LLM du tout.
+    const urls = email.html ? extraireUrlsAnnonces(email.html) : [];
+    const connus = urls.length > 0 ? await trouverConnusParUrl(urls, profile.id) : new Map();
+
+    if (urls.length > 0 && connus.size === urls.length) {
+      mailsIgnores += 1;
+      console.log(`  → ${urls.length} annonce(s) déjà connue(s), LLM ignoré.`);
+
+      await marquerVus(urls.map((u) => connus.get(u)!.listingId));
+
+      for (const url of urls) {
+        const c = connus.get(url)!;
+        total += 1;
+        if (c.resultat.eligible) eligibles += 1;
+        if (c.resultat.prixM2 !== null && c.resultat.prixM2 < SEUIL_PRIX_M2_PLAUSIBLE) {
+          surfacesAVerifier += 1;
+        }
+        console.log(formatLigne({ ville: c.ville, prix: c.prix }, c.resultat, false));
+      }
+      continue;
+    }
+
+    const { listings, usage } = await extractListings(email);
+    appelsLLM += 1;
+    totalInputTokens += usage.inputTokens;
+    totalOutputTokens += usage.outputTokens;
     console.log(`  → ${listings.length} annonce(s) extraite(s).`);
 
     associerUrlsAnnonces(listings, email.html, email.subject);
+    associerImagesAnnonces(listings, email.html, email.subject);
 
     for (const listing of listings) {
       total += 1;
@@ -82,12 +129,21 @@ async function main() {
         surfacesAVerifier += 1;
       }
 
-      console.log(formatLigne(listing, resultat));
+      console.log(formatLigne(listing, resultat, true));
     }
   }
 
+  const coutEstime =
+    (totalInputTokens / 1_000_000) * PRIX_INPUT_PAR_MTOK +
+    (totalOutputTokens / 1_000_000) * PRIX_OUTPUT_PAR_MTOK;
+
   console.log(
     `\n📦 Récap : ${total} annonce(s) au total, ${nouvelles} nouvelle(s), ${eligibles} éligible(s), ${surfacesAVerifier} surface(s) à vérifier.`,
+  );
+  console.log(
+    `🔢 LLM : ${appelsLLM} appel(s) (${mailsIgnores} mail(s) ignoré(s) sans appel) — ` +
+      `${totalInputTokens} tokens entrée + ${totalOutputTokens} tokens sortie — ` +
+      `coût estimé $${coutEstime.toFixed(4)} (tarif intro Sonnet 5 : $${PRIX_INPUT_PAR_MTOK}/$${PRIX_OUTPUT_PAR_MTOK} par MTok, jusqu'au 2026-08-31).`,
   );
 }
 
