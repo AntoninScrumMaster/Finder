@@ -1,13 +1,25 @@
 import { NextResponse } from "next/server";
-import { lancerIngestion } from "@/index";
 
 /**
- * Seule route qui déclenche le pipeline d'ingestion (IMAP + extraction LLM).
- * Coûteuse par nature — jamais appelée automatiquement, uniquement sur clic
- * explicite du bouton "Rechercher de nouvelles annonces".
+ * Ingestion (IMAP + extraction LLM) désactivée par défaut — réservée à
+ * l'usage local (npm run dev avec NEXT_PUBLIC_ENABLE_INGEST=true, ou
+ * npm run ingest en CLI). Sur Vercel, où seul le front est déployé, cette
+ * route reste absente/désactivée : le flag est laissé à false, donc la
+ * requête est rejetée AVANT tout import de src/index.ts (et donc de
+ * imap.ts) — le code d'ingestion n'est jamais chargé ni exécuté en prod.
  */
+const INGESTION_ACTIVEE = process.env.NEXT_PUBLIC_ENABLE_INGEST === "true";
+
 export async function POST() {
+  if (!INGESTION_ACTIVEE) {
+    return NextResponse.json(
+      { error: "Ingestion désactivée sur ce déploiement (NEXT_PUBLIC_ENABLE_INGEST n'est pas actif)." },
+      { status: 404 },
+    );
+  }
+
   try {
+    const { lancerIngestion } = await import("@/index");
     const recap = await lancerIngestion();
     return NextResponse.json(recap);
   } catch (error) {

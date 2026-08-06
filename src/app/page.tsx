@@ -12,6 +12,15 @@ import PanneauVerdict from "@/components/PanneauVerdict";
 
 const N_VERDICT = 5;
 
+/**
+ * L'ingestion (bouton "Rechercher") ne doit jamais être exposée sur un
+ * déploiement où seul le front tourne (Vercel) : l'API /api/rechercher y
+ * est de toute façon désactivée côté serveur, ce flag évite en plus
+ * d'afficher un bouton qui échouerait systématiquement. Actif seulement si
+ * NEXT_PUBLIC_ENABLE_INGEST=true (usage local).
+ */
+const INGESTION_ACTIVEE = process.env.NEXT_PUBLIC_ENABLE_INGEST === "true";
+
 export default function Page() {
   const [criteres, setCriteres] = useState<CriteresFormulaire>(CRITERES_PAR_DEFAUT);
   const [mode, setMode] = useState<Mode>("cashflow");
@@ -106,12 +115,14 @@ export default function Page() {
           <p className="text-sm text-zinc-500">Recherche et analyse de biens locatifs</p>
         </div>
 
-        <BoutonRecherche
-          onClick={lancerRecherche}
-          enCours={rechercheEnCours}
-          recap={recap}
-          erreur={erreurRecherche}
-        />
+        {INGESTION_ACTIVEE && (
+          <BoutonRecherche
+            onClick={lancerRecherche}
+            enCours={rechercheEnCours}
+            recap={recap}
+            erreur={erreurRecherche}
+          />
+        )}
 
         <FormulaireCriteres
           criteres={criteres}
