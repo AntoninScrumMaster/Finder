@@ -1,5 +1,5 @@
-import { supabase } from "./supabase.js";
-import type { Listing } from "./extract.js";
+import { supabase } from "./supabase";
+import type { Listing } from "./extract";
 
 /**
  * Profil de recherche (table search_profiles). Les champs "..._pct" sont des

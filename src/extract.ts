@@ -1,5 +1,5 @@
 import Anthropic from "@anthropic-ai/sdk";
-import type { RawEmail } from "./imap.js";
+import type { RawEmail } from "./imap";
 
 export interface Listing {
   source: "leboncoin" | "seloger" | "pap" | "bienici" | "autre";

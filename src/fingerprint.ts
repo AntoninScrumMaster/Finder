@@ -1,5 +1,5 @@
 import { createHash } from "node:crypto";
-import type { Listing } from "./extract.js";
+import type { Listing } from "./extract";
 
 /**
  * Calcule une empreinte SHA1 stable pour un bien immobilier, afin que deux

@@ -1,8 +1,17 @@
-import { supabase } from "./supabase.js";
-import { fingerprint } from "./fingerprint.js";
-import { resoudreCommune } from "./geo.js";
-import { loyerM2, calculeRentabilite, type SearchProfile } from "./rentabilite.js";
-import type { Listing } from "./extract.js";
+import { supabase } from "./supabase";
+import { fingerprint } from "./fingerprint";
+import { resoudreCommune } from "./geo";
+import { loyerM2, calculeRentabilite, type SearchProfile } from "./rentabilite";
+import {
+  scoreCashflow,
+  scoreRendement,
+  scoreFiabilite,
+  scoreDpe,
+  determinerEtat,
+  type SousScores,
+  type EtatBien,
+} from "./scoring";
+import type { Listing } from "./extract";
 
 /**
  * Schéma Supabase attendu par ce module (à faire correspondre à la migration
@@ -23,6 +32,8 @@ import type { Listing } from "./extract.js";
  *   loyer_m2_zone numeric, prix_m2 numeric, rendement_brut numeric,
  *   rendement_net numeric, cashflow_mensuel numeric, fiabilite_loyer text,
  *   niveau_loyer text, eligible boolean, exclusion_raison text, verdict text,
+ *   etat etat_bien ('ok'|'a_verifier'|'ecarte'), score_cashflow numeric,
+ *   score_rendement numeric, score_fiabilite numeric, score_dpe numeric,
  *   unique(listing_id, profile_id))
  *
  * search_profiles(id uuid pk, nom text, actif boolean,
@@ -33,13 +44,6 @@ import type { Listing } from "./extract.js";
  *   seuil_rendement_brut_min numeric, seuil_rendement_net_min numeric,
  *   dpe_max text, created_at timestamptz default now())
  */
-
-const ORDRE_DPE = ["A", "B", "C", "D", "E", "F", "G"] as const;
-type LettreDpe = (typeof ORDRE_DPE)[number];
-
-function indexDpe(valeur: string): number {
-  return ORDRE_DPE.indexOf(valeur as LettreDpe);
-}
 
 const PROFIL_DEFAUT = {
   nom: "Défaut",
@@ -220,6 +224,162 @@ export async function marquerVus(listingIds: string[]): Promise<void> {
   }
 }
 
+export interface BienAVerifier {
+  ville: string | null;
+  prix: number | null;
+  raison: string | null;
+}
+
+interface AVerifierRow {
+  exclusion_raison: string | null;
+  listings: { ville: string | null; prix: number | null } | null;
+}
+
+/** Liste les biens à l'état 'a_verifier' pour un profil, avec leur raison. */
+export async function listerAVerifier(profileId: string): Promise<BienAVerifier[]> {
+  const { data, error } = await supabase
+    .from("analyses")
+    .select("exclusion_raison, listings(ville, prix)")
+    .eq("profile_id", profileId)
+    .eq("etat", "a_verifier" satisfies EtatBien);
+
+  if (error) {
+    throw new Error(`Lecture des analyses 'a_verifier' échouée : ${error.message}`);
+  }
+
+  return ((data ?? []) as unknown as AVerifierRow[]).map((l) => ({
+    ville: l.listings?.ville ?? null,
+    prix: l.listings?.prix ?? null,
+    raison: l.exclusion_raison,
+  }));
+}
+
+export interface DonneesPourAnalyse {
+  listingId: string;
+  prix: number | null;
+  surface: number | null;
+  typeBien: Listing["type_bien"];
+  dpe: string;
+  codeInsee: string | null;
+  codeDepartement: string | null;
+}
+
+/**
+ * Calcule rentabilité + scoring hybride + etat pour un bien déjà en base
+ * (commune déjà résolue) et enregistre le résultat dans `analyses`. Extrait
+ * de processListing pour être réutilisable par un backfill (src/backfill.ts)
+ * sans repasser par l'extraction LLM ni la résolution de commune.
+ */
+export async function calculerEtEnregistrerAnalyse(
+  donnees: DonneesPourAnalyse,
+  profile: SearchProfile,
+): Promise<Omit<ResultatTraitement, "nouveau">> {
+  // --- Rentabilité ---
+  let loyerMensuelEstime: number | null = null;
+  let loyerM2Zone: number | null = null;
+  let fiabiliteLoyer: string | null = null;
+  let niveauLoyer: string | null = null;
+  let prixM2: number | null = null;
+  let rendementBrut: number | null = null;
+  let rendementNet: number | null = null;
+  let cashflowMensuel: number | null = null;
+
+  if (donnees.prix !== null && donnees.surface !== null) {
+    prixM2 = donnees.prix / donnees.surface;
+  }
+
+  if (donnees.codeInsee && donnees.prix !== null && donnees.surface !== null) {
+    const zone = await loyerM2(donnees.codeInsee, donnees.codeDepartement, donnees.typeBien);
+
+    if (zone) {
+      loyerM2Zone = zone.loyerM2;
+      fiabiliteLoyer = zone.fiabilite;
+      niveauLoyer = zone.niveau;
+      loyerMensuelEstime = donnees.surface * zone.loyerM2;
+
+      const metriques = calculeRentabilite(
+        donnees.prix,
+        loyerMensuelEstime,
+        donnees.surface,
+        profile,
+      );
+
+      rendementBrut = metriques.rendementBrut;
+      rendementNet = metriques.rendementNet;
+      cashflowMensuel = metriques.cashflow;
+    }
+  }
+
+  // --- Scoring hybride : seule source de vérité pour eligible/verdict/etat.
+  // Les seuils du profil (prix_max, surface_min, dpe_max,
+  // seuil_rendement_brut_min, seuil_rendement_net_min) sont intégrés dans
+  // determinerEtat() — il n'y a plus de calcul d'éligibilité séparé.
+  const sousScores: SousScores = {
+    scoreCashflow: scoreCashflow(cashflowMensuel),
+    scoreRendement: scoreRendement(rendementNet),
+    scoreFiabilite: scoreFiabilite(niveauLoyer, fiabiliteLoyer),
+    scoreDpe: scoreDpe(donnees.dpe),
+  };
+
+  const { etat, raison } = determinerEtat(
+    {
+      cashflowMensuel,
+      rendementBrut,
+      rendementNet,
+      prixM2,
+      loyerCalculable: niveauLoyer !== null,
+      prix: donnees.prix,
+      surface: donnees.surface,
+      dpe: donnees.dpe,
+    },
+    profile,
+  );
+
+  // Conservée par compat pour la colonne `eligible`, mais toujours dérivée
+  // de `etat` — jamais recalculée indépendamment.
+  const eligible = etat !== "ecarte";
+  const verdict = eligible ? "a_voir" : "ecarte_filtre";
+
+  const { error: erreurAnalyse } = await supabase.from("analyses").upsert(
+    {
+      listing_id: donnees.listingId,
+      profile_id: profile.id,
+      loyer_mensuel_estime: loyerMensuelEstime,
+      loyer_m2_zone: loyerM2Zone,
+      prix_m2: prixM2,
+      rendement_brut: rendementBrut,
+      rendement_net: rendementNet,
+      cashflow_mensuel: cashflowMensuel,
+      fiabilite_loyer: fiabiliteLoyer,
+      niveau_loyer: niveauLoyer,
+      eligible,
+      exclusion_raison: raison,
+      verdict,
+      etat,
+      score_cashflow: sousScores.scoreCashflow,
+      score_rendement: sousScores.scoreRendement,
+      score_fiabilite: sousScores.scoreFiabilite,
+      score_dpe: sousScores.scoreDpe,
+    },
+    { onConflict: "listing_id,profile_id" },
+  );
+
+  if (erreurAnalyse) {
+    throw new Error(`Upsert analyses échoué : ${erreurAnalyse.message}`);
+  }
+
+  return {
+    eligible,
+    raison,
+    prixM2,
+    rendementBrut,
+    rendementNet,
+    cashflow: cashflowMensuel,
+    niveauLoyer,
+    fiabiliteLoyer,
+  };
+}
+
 /**
  * Enregistre (ou met à jour) une annonce dans Supabase, résout sa commune,
  * calcule sa rentabilité et met à jour son analyse pour le profil donné.
@@ -333,156 +493,18 @@ export async function processListing(
     }
   }
 
-  // --- Rentabilité ---
-  let loyerMensuelEstime: number | null = null;
-  let loyerM2Zone: number | null = null;
-  let fiabiliteLoyer: string | null = null;
-  let niveauLoyer: string | null = null;
-  let prixM2: number | null = null;
-  let rendementBrut: number | null = null;
-  let rendementNet: number | null = null;
-  let cashflowMensuel: number | null = null;
-
-  if (listing.prix !== null && listing.surface !== null) {
-    prixM2 = listing.prix / listing.surface;
-  }
-
-  if (codeInsee && listing.prix !== null && listing.surface !== null) {
-    const zone = await loyerM2(
-      codeInsee,
-      commune?.codeDepartement ?? null,
-      listing.type_bien,
-    );
-
-    if (zone) {
-      loyerM2Zone = zone.loyerM2;
-      fiabiliteLoyer = zone.fiabilite;
-      niveauLoyer = zone.niveau;
-      loyerMensuelEstime = listing.surface * zone.loyerM2;
-
-      const metriques = calculeRentabilite(
-        listing.prix,
-        loyerMensuelEstime,
-        listing.surface,
-        profile,
-      );
-
-      rendementBrut = metriques.rendementBrut;
-      rendementNet = metriques.rendementNet;
-      cashflowMensuel = metriques.cashflow;
-    }
-  }
-
-  // --- Éligibilité ---
-  const { eligible, raison } = evaluerEligibilite(
-    listing,
-    profile,
-    rendementBrut,
-    rendementNet,
-  );
-
-  const verdict = eligible ? "a_voir" : "ecarte_filtre";
-
-  const { error: erreurAnalyse } = await supabase.from("analyses").upsert(
+  const resultatAnalyse = await calculerEtEnregistrerAnalyse(
     {
-      listing_id: listingId,
-      profile_id: profile.id,
-      loyer_mensuel_estime: loyerMensuelEstime,
-      loyer_m2_zone: loyerM2Zone,
-      prix_m2: prixM2,
-      rendement_brut: rendementBrut,
-      rendement_net: rendementNet,
-      cashflow_mensuel: cashflowMensuel,
-      fiabilite_loyer: fiabiliteLoyer,
-      niveau_loyer: niveauLoyer,
-      eligible,
-      exclusion_raison: raison,
-      verdict,
+      listingId,
+      prix: listing.prix,
+      surface: listing.surface,
+      typeBien: listing.type_bien,
+      dpe: listing.dpe,
+      codeInsee,
+      codeDepartement: commune?.codeDepartement ?? null,
     },
-    { onConflict: "listing_id,profile_id" },
+    profile,
   );
 
-  if (erreurAnalyse) {
-    throw new Error(`Upsert analyses échoué : ${erreurAnalyse.message}`);
-  }
-
-  return {
-    nouveau,
-    eligible,
-    raison,
-    prixM2,
-    rendementBrut,
-    rendementNet,
-    cashflow: cashflowMensuel,
-    niveauLoyer,
-    fiabiliteLoyer,
-  };
-}
-
-/**
- * N'écarte un bien QUE si un seuil du profil est explicitement défini ET
- * violé. Un DPE 'NC' (inconnu) n'écarte jamais un bien.
- */
-function evaluerEligibilite(
-  listing: Listing,
-  profile: SearchProfile,
-  rendementBrut: number | null,
-  rendementNet: number | null,
-): { eligible: boolean; raison: string | null } {
-  if (
-    profile.prix_max !== null &&
-    listing.prix !== null &&
-    listing.prix > profile.prix_max
-  ) {
-    return {
-      eligible: false,
-      raison: `Prix (${listing.prix} €) supérieur au maximum (${profile.prix_max} €)`,
-    };
-  }
-
-  if (
-    profile.surface_min !== null &&
-    listing.surface !== null &&
-    listing.surface < profile.surface_min
-  ) {
-    return {
-      eligible: false,
-      raison: `Surface (${listing.surface} m²) inférieure au minimum (${profile.surface_min} m²)`,
-    };
-  }
-
-  if (
-    profile.seuil_rendement_brut_min !== null &&
-    rendementBrut !== null &&
-    rendementBrut < profile.seuil_rendement_brut_min
-  ) {
-    return {
-      eligible: false,
-      raison: `Rendement brut (${rendementBrut.toFixed(2)} %) inférieur au seuil (${profile.seuil_rendement_brut_min} %)`,
-    };
-  }
-
-  if (
-    profile.seuil_rendement_net_min !== null &&
-    rendementNet !== null &&
-    rendementNet < profile.seuil_rendement_net_min
-  ) {
-    return {
-      eligible: false,
-      raison: `Rendement net (${rendementNet.toFixed(2)} %) inférieur au seuil (${profile.seuil_rendement_net_min} %)`,
-    };
-  }
-
-  if (
-    profile.dpe_max !== null &&
-    listing.dpe !== "NC" &&
-    indexDpe(listing.dpe) > indexDpe(profile.dpe_max)
-  ) {
-    return {
-      eligible: false,
-      raison: `DPE (${listing.dpe}) moins bon que le maximum autorisé (${profile.dpe_max})`,
-    };
-  }
-
-  return { eligible: true, raison: null };
+  return { nouveau, ...resultatAnalyse };
 }

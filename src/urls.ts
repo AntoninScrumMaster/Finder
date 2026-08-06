@@ -1,4 +1,4 @@
-import type { Listing } from "./extract.js";
+import type { Listing } from "./extract";
 
 /**
  * Extrait, dans l'ordre d'apparition du HTML, les URLs de détail de chaque
