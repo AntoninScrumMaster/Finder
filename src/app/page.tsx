@@ -1,6 +1,6 @@
 "use client";
 
-import { useMemo, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import type { Mode } from "@/scoring";
 import type { CriteresFormulaire, ResultatAnalyse, RecapRecherche } from "@/types-front";
 import { CRITERES_PAR_DEFAUT } from "@/types-front";
@@ -22,6 +22,18 @@ const N_VERDICT = 5;
 const INGESTION_ACTIVEE = process.env.NEXT_PUBLIC_ENABLE_INGEST === "true";
 
 export default function Page() {
+  // NEXT_PUBLIC_ENABLE_INGEST est censé être identique entre le rendu
+  // serveur et le bundle client (inlining au build), mais en dev le cache
+  // Turbopack peut désynchroniser les deux après un changement de .env,
+  // provoquant un mismatch d'hydratation. On ne rend le bloc conditionné
+  // par ce flag qu'après le montage client, où serveur et client sont déjà
+  // réconciliés — le premier rendu (SSR + hydratation) est donc toujours
+  // identique des deux côtés (rien), et le bouton apparaît juste après.
+  const [monte, setMonte] = useState(false);
+  useEffect(() => {
+    setMonte(true);
+  }, []);
+
   const [criteres, setCriteres] = useState<CriteresFormulaire>(CRITERES_PAR_DEFAUT);
   const [mode, setMode] = useState<Mode>("cashflow");
 
@@ -115,7 +127,7 @@ export default function Page() {
           <p className="text-sm text-zinc-500">Recherche et analyse de biens locatifs</p>
         </div>
 
-        {INGESTION_ACTIVEE && (
+        {monte && INGESTION_ACTIVEE && (
           <BoutonRecherche
             onClick={lancerRecherche}
             enCours={rechercheEnCours}
